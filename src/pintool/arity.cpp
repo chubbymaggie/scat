@@ -17,6 +17,7 @@
 #define FN_NAME 0
 #define FN_ADDR 1
 
+#define DEBUG_ENABLED
 #include "utils/debug.h"
 
 #include "utils/registers.h"
@@ -65,6 +66,8 @@ bool *reg_ret_since_written;
  * a valid return candidate so far */
 bool *reg_maybe_return;
 
+ADDRINT debug_fid;
+
 unsigned int fn_add(ADDRINT addr, string f_name) {
     if (nb_fn >= NB_FN_MAX) {
         return 0;
@@ -86,6 +89,10 @@ unsigned int fn_add(ADDRINT addr, string f_name) {
  *  is called in the instrumented binary
  */
 VOID fn_call(unsigned int fid) {
+    if (fid == debug_fid) {
+        debug("Calling %s\n", fname[fid]->c_str());
+    }
+
     call_stack.push(fid);
     if (fid != 0 && !call_stack.is_top_forgotten()) {
         nb_call[call_stack.top()]++;
@@ -104,10 +111,13 @@ VOID fn_call(unsigned int fid) {
  */
 VOID fn_ret() {
     if (!call_stack.is_top_forgotten()) {
-        if (reg_maybe_return[REGF_AX] && !reg_ret_since_written[REGF_AX])
+        if ((reg_maybe_return[REGF_AX] && !reg_ret_since_written[REGF_AX])
+                || (reg_maybe_return[REGF_XMM0] && !reg_ret_since_written[REGF_XMM0])) {
+            if (call_stack.top() == debug_fid) {
+                debug("Detected return in fn_ret\n");
+            }
             nb_ret[call_stack.top()]++;
-        if (reg_maybe_return[REGF_XMM0] && !reg_ret_since_written[REGF_XMM0])
-            nb_ret[call_stack.top()]++;
+        }
     }
 
     for (int regf = REGF_FIRST; regf <= REGF_LAST; regf++) {
@@ -118,9 +128,10 @@ VOID fn_ret() {
 }
 
 
-VOID reg_access(REGF regf, UINT32 reg_size) {
+VOID reg_access(CONTEXT* ctxt, REGF regf, UINT32 reg_size, ADDRINT addr, string* dis) {
     if (call_stack.is_empty())
         return;
+
 
     // Discard the previous write as a potential
     // return value. Reading the value does not
@@ -130,14 +141,22 @@ VOID reg_access(REGF regf, UINT32 reg_size) {
     // We're taking a precautious approach
     // and hoping the call stack propagation
     // on register access will detect it instead
+    if (call_stack.top() == debug_fid && reg_maybe_return[regf]) {
+        debug("  %lX Read reg %s in %s\n", addr, regf == REGF_AX ? "AX" : "XMM0", dis->c_str());
+    }
     reg_maybe_return[regf] = false;
 
     if (regf == REGF_AX || regf == REGF_XMM0) {
         if (reg_ret_since_written[regf]) {
             // Propagate the return value up the call stack
             for (int i = call_stack.height() + 1; i <= written[regf]; i++)
-                if (!call_stack.is_forgotten(i))
+                if (!call_stack.is_forgotten(i)) {
+                    if (call_stack.peek(i) == debug_fid) {
+                        debug("Detected return in reg_access\n");
+                    }
+
                     nb_ret[call_stack.peek(i)] += 1;
+                }
 
             // REGF_AX is not used as a parameter
             if (regf == REGF_AX)
@@ -174,18 +193,31 @@ VOID reg_access(REGF regf, UINT32 reg_size) {
     }
 }
 
-VOID reg_write(REGF regf) {
+VOID reg_write(REGF regf, ADDRINT addr, string* dis) {
     if (call_stack.is_empty())
         return;
 
     written[regf] = call_stack.height();
-    if (regf == REGF_AX || regf == REGF_XMM0)
+    if (regf == REGF_AX || regf == REGF_XMM0) {
+        if (call_stack.top() == debug_fid && !reg_maybe_return[regf]) {
+            debug("  %lX Wrote reg %s in %s\n", addr, regf == REGF_AX ? "AX" : "XMM0", dis->c_str());
+        }
+
         reg_maybe_return[regf] = true;
+    }
     reg_ret_since_written[regf] = false;
 }
 
 VOID register_function_name(RTN rtn, VOID *v) {
-    fn_add(RTN_Address(rtn), RTN_Name(rtn));
+    ADDRINT addr = RTN_Address(rtn);
+    string fname = RTN_Name(rtn);
+    if (fname.compare("pdf_end_group") == 0) {
+        debug("Found %lX %s\n", addr, fname.c_str());
+        debug_fid = fn_add(addr, fname);
+    }
+    else {
+        fn_add(addr, fname);
+    }
 }
 
 /* Array of all the monitored registers */
@@ -228,21 +260,29 @@ VOID instrument_instruction(INS ins, VOID *v) {
 
     for (int i = 0; i < reg_watch_size; i++) {
         REG reg = reg_watch[i];
+        ADDRINT addr = INS_Address(ins);
+        string* dis = new string(INS_Disassemble(ins));
 
         if (INS_RegRContain(ins, reg) && !INS_RegWContain(ins, reg)) {
             INS_InsertCall(ins,
                         IPOINT_BEFORE,
                         (AFUNPTR) reg_access,
+                        IARG_CONTEXT,
                         IARG_UINT32, regf(reg),
                         IARG_UINT32, reg_size(reg),
+                        IARG_ADDRINT, addr,
+                        IARG_PTR, dis,
                         IARG_END);
         } else if (INS_RegRContain(ins, reg) && INS_RegWContain(ins, reg)) {
             if ((INS_OperandCount(ins) >= 2 && INS_OperandReg(ins, 0) != INS_OperandReg(ins, 1)) || INS_IsMov(ins)) {
                 INS_InsertCall(ins,
                         IPOINT_BEFORE,
                         (AFUNPTR) reg_access,
+                        IARG_CONTEXT,
                         IARG_UINT32, regf(reg),
                         IARG_UINT32, reg_size(reg),
+                        IARG_ADDRINT, addr,
+                        IARG_PTR, dis,
                         IARG_END);
             }
         }
@@ -251,6 +291,8 @@ VOID instrument_instruction(INS ins, VOID *v) {
                         IPOINT_BEFORE,
                         (AFUNPTR) reg_write,
                         IARG_UINT32, regf(reg),
+                        IARG_ADDRINT, addr,
+                        IARG_PTR, dis,
                         IARG_END);
         }
     }
