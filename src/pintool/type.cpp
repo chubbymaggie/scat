@@ -18,19 +18,14 @@
 
 #define NB_FN_MAX               10000
 #define MAX_DEPTH               1000
-#define NB_VALS_TO_CONCLUDE     100
+#define MAX_VALS_TO_COLLECT     100
 #define NB_CALLS_TO_CONCLUDE    50
 #define THRESHOLD               0.75
-
-#define FN_NAME 1
-#define FN_ADDR 0
 
 ifstream ifile;
 KNOB<string> KnobInputFile(KNOB_MODE_WRITEONCE, "pintool", "i", "stdin", "Specify an intput file");
 ofstream ofile;
 KNOB<string> KnobOutputFile(KNOB_MODE_WRITEONCE, "pintool", "o", "stdout", "Specify an output file");
-UINT64 FN_MODE;
-KNOB<string> KnobFunctionMode(KNOB_MODE_WRITEONCE, "pintool", "fn", "name", "Specify a function mode");
 
 
 /* Call stack */
@@ -38,8 +33,9 @@ HollowStack<MAX_DEPTH, FID> call_stack;
 
 /* Arity informations for each functions */
 unsigned int *nb_param_int;
-unsigned int *nb_param_stack;
+unsigned int *nb_param_int_stack;
 unsigned int *nb_param_float;
+unsigned int *nb_param_float_stack;
 unsigned int *has_return;
 bool **param_is_not_addr;
 
@@ -90,20 +86,23 @@ string read_part(char* c) {
 // Register and initialize the functions found with the arity pintool
 void fn_registered(FID fid,
             unsigned int _nb_param_int,
-            unsigned int _nb_param_stack,
+            unsigned int _nb_param_int_stack,
             unsigned int _nb_param_float,
+            unsigned int _nb_param_float_stack,
             unsigned int _has_return,
             vector<UINT32> int_idx) {
     nb_param_int[fid] = _nb_param_int;
-    nb_param_stack[fid] = _nb_param_stack;
+    nb_param_int_stack[fid] = _nb_param_int_stack;
     nb_param_float[fid] = _nb_param_float;
+    nb_param_float_stack[fid] = _nb_param_float_stack;
     has_return[fid] = _has_return;
     param_is_not_addr[fid] = (bool *) malloc((_nb_param_int + 1) * sizeof(bool));
 
     nb_call[fid] = 0;
-    param_val[fid] = (list<UINT64> **) malloc((_nb_param_int + 1) * sizeof(list<UINT64> *));
+    unsigned int param_val_size = 1 + _nb_param_int + _nb_param_int_stack;
+    param_val[fid] = (list<UINT64> **) malloc(param_val_size * sizeof(list<UINT64> *));
 
-    for (unsigned int pid = 0; pid < _nb_param_int + 1; pid++) {
+    for (unsigned int pid = 0; pid < param_val_size; pid++) {
         param_is_not_addr[fid][pid] = false;
         param_val[fid][pid] = new list<UINT64>();
     }
@@ -128,8 +127,9 @@ VOID Commence() {
             string name = read_part(&m);
 
             UINT64 int_arity = atol(read_part(&m).c_str());
-            UINT64 stack_arity = atol(read_part(&m).c_str());
+            UINT64 int_stack_arity = atol(read_part(&m).c_str());
             UINT64 float_arity = atol(read_part(&m).c_str());
+            UINT64 float_stack_arity = atol(read_part(&m).c_str());
             UINT64 has_return = atol(read_part(&m).c_str());
 
             vector<UINT32> int_param_idx;
@@ -145,50 +145,55 @@ VOID Commence() {
 
             FID fid = fn_register(img_name, img_addr, name);
             if (fid != FID_UNKNOWN) {
-                fn_registered(fid, int_arity, stack_arity, float_arity, has_return,
+                fn_registered(fid,
+                    int_arity, int_stack_arity,
+                    float_arity, float_stack_arity,
+                    has_return,
                     int_param_idx);
             }
         }
     }
 }
 
-inline UINT64 sp(CONTEXT* ctxt) {
-    UINT64 sp;
-    PIN_GetContextRegval(ctxt, REG_RSP, (UINT8*) &sp);
-    return sp;
+REG param_reg(unsigned int pid) {
+    switch (pid) {
+    case 0:
+        return REG_RAX;
+    case 1:
+        return REG_RDI;
+    case 2:
+        return REG_RSI;
+    case 3:
+        return REG_RDX;
+    case 4:
+        return REG_RCX;
+    case 5:
+        return REG_R8;
+    case 6:
+        return REG_R9;
+    default:
+        return REG_INVALID();
+    }
 }
 
 VOID add_val(unsigned int fid, CONTEXT *ctxt, unsigned int pid) {
     trace_enter();
 
-    REG reg;
-    switch (pid) {
-    case 1:
-        reg = REG_RDI;
-        break;
-    case 2:
-        reg = REG_RSI;
-        break;
-    case 3:
-        reg = REG_RDX;
-        break;
-    case 4:
-        reg = REG_RCX;
-        break;
-    case 5:
-        reg = REG_R8;
-        break;
-    case 6:
-        reg = REG_R9;
-        break;
-    default:
-        trace_leave();
-        return;
+    UINT64 val;
+    if (pid < 1 + nb_param_int[fid]) {
+        PIN_GetContextRegval(ctxt, param_reg(pid), (UINT8*) &val);
+    }
+    else {
+        // Assumes this is called from fn_call (for sp to be accurate)
+        UINT64 sp;
+        PIN_GetContextRegval(ctxt, REG_RSP, (UINT8*) &sp);
+        unsigned int sp_offset = pid - (1 + nb_param_int[fid]);
+        UINT64* addr = (UINT64*) (sp + sp_offset * 8);
+        val = *addr;
     }
 
-    ADDRINT regv = PIN_GetContextReg(ctxt, reg);
-    if (regv != 0)
-        param_val[fid][pid]->push_front(regv);
+    if (val != 0)
+        param_val[fid][pid]->push_front(val);
 
     trace_leave();
 }
@@ -198,14 +203,11 @@ VOID fn_call(CONTEXT *ctxt, FID fid) {
 
     call_stack.push(fid);
 
-    if (nb_call[fid] >= NB_CALLS_TO_CONCLUDE) {
-        trace_leave();
-        return;
-    }
-
     nb_call[fid]++;
-    for (unsigned int pid = 1; pid <= nb_param_int[fid]; pid++) {
-        if (param_val[fid][pid]->size() < NB_VALS_TO_CONCLUDE)
+    unsigned int param_val_size = 1 + nb_param_int[fid] + nb_param_int_stack[fid];
+    for (unsigned int pid = 1; pid < param_val_size; pid++) {
+        if (!param_is_not_addr[fid][pid] &&
+                param_val[fid][pid]->size() < MAX_VALS_TO_COLLECT)
             add_val(fid, ctxt, pid);
     }
 
@@ -234,9 +236,9 @@ VOID fn_ret(CONTEXT *ctxt) {
     if (!call_stack.is_top_forgotten()) {
         FID fid = call_stack.top();
 
-        ADDRINT regv = PIN_GetContextReg(ctxt, REG_RAX);
-        if (regv != 0)
-            param_val[fid][0]->push_front(regv);
+        if (has_return[fid] == 1) {
+            add_val(fid, ctxt, 0);
+        }
     }
 
     call_stack.pop();
@@ -342,17 +344,18 @@ VOID Fini(INT32 code, VOID *v) {
 
         bool need_comma = false;
 
-        for (unsigned int pid = 0; pid <= nb_param_int[fid]; pid++) {
+        unsigned int param_val_size = 1 + nb_param_int[fid] + nb_param_int_stack[fid];
+        for (unsigned int pid = 0; pid < param_val_size; pid++) {
             if (pid == 0 && has_return[fid] == 0) {
                 append_type("VOID");
             }
             else if (pid == 0 && has_return[fid] == 2) {
                 append_type("FLOAT");
             }
-            else if (param_is_not_addr[fid][pid]) {
+            else if (pid < 1 + nb_param_int[fid] && param_is_not_addr[fid][pid]) {
                 append_type("INT");
             }
-            else if (param_val[fid][pid]->size() < NB_CALLS_TO_CONCLUDE / 3) {
+            else if (param_val[fid][pid]->size() == 0) {
                 append_type("UNDEF");
             }
             else {
@@ -370,12 +373,9 @@ VOID Fini(INT32 code, VOID *v) {
             }
         }
 
-        for (unsigned int pid = 0; pid < nb_param_stack[fid]; pid++) {
-            // TODO: Really infer type
-            append_type("INT");
-        }
-
-        for (unsigned int pid = 0; pid < nb_param_float[fid]; pid++) {
+        for (unsigned int pid = 0;
+                pid < nb_param_float[fid] + nb_param_float_stack[fid];
+                pid++) {
             append_type("FLOAT");
         }
 
@@ -403,8 +403,9 @@ VOID image_loaded(IMG img, void* data) {
 
 int main(int argc, char * argv[]) {
     nb_param_int = (unsigned int *) malloc(NB_FN_MAX * sizeof(unsigned int));
-    nb_param_stack = (unsigned int *) malloc(NB_FN_MAX * sizeof(unsigned int));
+    nb_param_int_stack = (unsigned int *) malloc(NB_FN_MAX * sizeof(unsigned int));
     nb_param_float = (unsigned int *) malloc(NB_FN_MAX * sizeof(unsigned int));
+    nb_param_float_stack = (unsigned int *) malloc(NB_FN_MAX * sizeof(unsigned int));
     has_return = (unsigned int *) calloc(NB_FN_MAX, sizeof(bool));
     param_is_not_addr = (bool **) malloc(NB_FN_MAX * sizeof(bool *));
 
@@ -421,16 +422,6 @@ int main(int argc, char * argv[]) {
     ifile.open(KnobInputFile.Value().c_str());
     ofile.open(KnobOutputFile.Value().c_str());
 
-    // TODO better way to get mode from cli
-    if (strcmp(KnobFunctionMode.Value().c_str(), "name") == 0) {
-        FN_MODE = FN_NAME;
-    } else if (strcmp(KnobFunctionMode.Value().c_str(), "addr") == 0) {
-        FN_MODE = FN_ADDR;
-    } else {
-        /* By default, names are used */
-        FN_MODE = FN_NAME;
-    }
-
     INS_AddInstrumentFunction(Instruction, 0);
     IMG_AddInstrumentFunction(image_loaded, 0);
 
@@ -440,7 +431,7 @@ int main(int argc, char * argv[]) {
 
     fn_registry_init(NB_FN_MAX);
     vector<UINT32> unknown_int_idx;
-    fn_registered(FID_UNKNOWN, 0, 0, 0, 0, unknown_int_idx);
+    fn_registered(FID_UNKNOWN, 0, 0, 0, 0, 0, unknown_int_idx);
 
     debug_trace_init();
     PIN_StartProgram();

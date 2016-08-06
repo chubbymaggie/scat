@@ -4,7 +4,6 @@
 #include <fstream>
 #include <cmath>
 #include <stdlib.h>
-#include <stdint.h>
 
 #include <string.h>
 
@@ -16,12 +15,10 @@
 #define PARAM_THRESHOLD         0.10
 #define RETURN_THRESHOLD        0.05
 
-#define PARAM_INT_COUNT         6
-#define PARAM_FLOAT_COUNT       8
-#define PARAM_STACK_COUNT       10
-
-#define FN_NAME 0
-#define FN_ADDR 1
+#define PARAM_INT_COUNT          6
+#define PARAM_INT_STACK_COUNT   10
+#define PARAM_FLOAT_COUNT        8
+#define PARAM_FLOAT_STACK_COUNT  6
 
 #include "utils/debug.h"
 #include "utils/functions_registry.h"
@@ -29,26 +26,28 @@
 #include "utils/hollow_stack.h"
 
 ofstream ofile;
+// TODO change "mouaha"
 KNOB<string> KnobOutputFile(KNOB_MODE_WRITEONCE, "pintool", "o", "mouaha", "Specify an output file");
-UINT64 FN_MODE;
-KNOB<string> KnobFunctionMode(KNOB_MODE_WRITEONCE, "pintool", "fn", "name", "Specify a function mode");
-
-/* Number of calls of each function */
-UINT64 *nb_call;
-/* Number of parameters int/addr for each function */
-UINT64 **nb_param_intaddr;
-/* Number of parameters float for each function */
-UINT64 **nb_param_float;
-/* Number of stack parameters for each function */
-UINT64 **nb_param_stack;
-/* Return value detected */
-UINT64 *nb_ret_int;
-UINT64 *nb_ret_float;
 
 /* Call stack */
 HollowStack<MAX_DEPTH, FID> call_stack;
 /* A stack which keeps track of the program stack pointers */
 HollowStack<MAX_DEPTH, UINT64> sp_stack;
+
+/* Number of calls of each function */
+UINT64 *nb_call;
+/* Number of parameters for each function */
+UINT64 **nb_param_int;
+UINT64 **nb_param_int_stack;
+UINT64 **nb_param_float;
+UINT64 **nb_param_float_stack;
+/* Return value detected */
+UINT64 *nb_ret_int;
+UINT64 *nb_ret_float;
+/* Store the minimum size of parameter/return
+   Used as a clue that this is not an address if below 64 bits
+   in type pintool */
+UINT64 **param_int_min_size;
 
 /*
  * Information relative to registers
@@ -61,21 +60,20 @@ bool *reg_ret_since_written;
 /* For each relevant register family, indicates if it is
  * a valid return candidate so far */
 bool *reg_maybe_return;
-
+/* For each register, store the size for the last write */
 UINT64 *last_written_size;
-/* Store the minimum size of parameter/return
-   Used as a clue that this is not an address if below 64 bits
-   in type pintool */
-UINT64 **param_min_size;
+
 
 void fn_registered(FID fid) {
     nb_call[fid] = 0;
-    nb_param_intaddr[fid] = (UINT64 *) calloc(PARAM_INT_COUNT, sizeof(UINT64));
-    param_min_size[fid] = (UINT64 *) calloc(PARAM_INT_COUNT + 1, sizeof(UINT64));
+    nb_param_int[fid] = (UINT64 *) calloc(PARAM_INT_COUNT, sizeof(UINT64));
+    param_int_min_size[fid] = (UINT64 *) calloc(PARAM_INT_COUNT + 1, sizeof(UINT64));
     for (int pid = 0; pid < PARAM_INT_COUNT + 1; pid++)
-        param_min_size[fid][pid] = 1024;
+        param_int_min_size[fid][pid] = 1024;
+    nb_param_int_stack[fid] = (UINT64 *) calloc(PARAM_INT_STACK_COUNT, sizeof(UINT64));
+
     nb_param_float[fid] = (UINT64 *) calloc(PARAM_FLOAT_COUNT, sizeof(UINT64));
-    nb_param_stack[fid] = (UINT64 *) calloc(PARAM_STACK_COUNT, sizeof(UINT64));
+    nb_param_float_stack[fid] = (UINT64 *) calloc(PARAM_FLOAT_STACK_COUNT, sizeof(UINT64));
 }
 
 inline UINT64 sp(CONTEXT* ctxt) {
@@ -123,7 +121,7 @@ VOID fn_indirect_call(CONTEXT* ctxt, ADDRINT target) {
     trace_leave();
 }
 
-void update_param_min_size(FID fid, UINT64 pid, REGF regf, UINT32 read_size) {
+void update_param_int_min_size(FID fid, UINT64 pid, REGF regf, UINT32 read_size) {
     // Take the maximum size between the last value written and the value read
     UINT64 candidate_min_size = read_size < last_written_size[regf]
             ? last_written_size[regf]
@@ -134,8 +132,8 @@ void update_param_min_size(FID fid, UINT64 pid, REGF regf, UINT32 read_size) {
     if (candidate_min_size == 0)
         return;
 
-    if (param_min_size[fid][pid] > candidate_min_size)
-        param_min_size[fid][pid] = candidate_min_size;
+    if (param_int_min_size[fid][pid] > candidate_min_size)
+        param_int_min_size[fid][pid] = candidate_min_size;
 }
 
 
@@ -183,7 +181,7 @@ VOID param_read(REGF regf, UINT32 reg_size) {
     }
     else {
         position = regf - REGF_DI;
-        nb_param = nb_param_intaddr;
+        nb_param = nb_param_int;
     }
 
     // Propagate the parameter up the call stack
@@ -191,8 +189,8 @@ VOID param_read(REGF regf, UINT32 reg_size) {
         if (!call_stack.is_forgotten(i)) {
             FID fid = call_stack.peek(i);
             nb_param[fid][position] += 1;
-            // +1 because param_min_size[fid][0] is for the return value
-            update_param_min_size(fid, position + 1, regf, reg_size);
+            // +1 because param_int_min_size[fid][0] is for the return value
+            update_param_int_min_size(fid, position + 1, regf, reg_size);
         }
     }
 
@@ -258,7 +256,7 @@ VOID return_write(REGF regf, UINT32 reg_size) {
     trace_leave();
 }
 
-VOID stack_read(ADDRINT addr, UINT32 size) {
+VOID stack_read(ADDRINT addr, UINT32 size, UINT64** nb_param, UINT32 param_count) {
     trace_enter();
 
     if (sp_stack.is_top_forgotten()) {
@@ -268,8 +266,8 @@ VOID stack_read(ADDRINT addr, UINT32 size) {
 
     UINT64 sp = sp_stack.top();
     UINT64 position = (addr - sp) / 8;
-    if (position >= 0 && position < PARAM_STACK_COUNT) {
-        nb_param_stack[call_stack.top()][position] += 1;
+    if (position >= 0 && position < param_count) {
+        nb_param[call_stack.top()][position] += 1;
     }
 
     trace_leave();
@@ -384,11 +382,32 @@ VOID instrument_instruction(INS ins, VOID *v) {
             // we only care about read in between them
             && !INS_IsRet(ins)
             && !INS_IsCall(ins)) {
-        INS_InsertCall(ins,
-                IPOINT_BEFORE,
-                (AFUNPTR) stack_read,
+
+        REG reg = REG_INVALID();
+        UINT32 operand_count = INS_OperandCount(ins);
+        for (UINT32 operand = 0; operand < operand_count; operand++) {
+            if (INS_OperandIsReg(ins, operand) && INS_OperandWritten(ins, operand)) {
+                reg = INS_OperandReg(ins, operand);
+                break;
+            }
+        }
+
+        UINT64** nb_param;
+        UINT32 nb_param_count;
+        if (REG_is_xmm(reg)) {
+            nb_param = nb_param_float_stack;
+            nb_param_count = PARAM_FLOAT_STACK_COUNT;
+        }
+        else {
+            nb_param = nb_param_int_stack;
+            nb_param_count = PARAM_INT_STACK_COUNT;
+        }
+
+        INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR) stack_read,
                 IARG_MEMORYREAD_EA,
                 IARG_MEMORYREAD_SIZE,
+                IARG_PTR, nb_param,
+                IARG_UINT32, nb_param_count,
                 IARG_END);
     }
 
@@ -431,8 +450,8 @@ VOID instrument_instruction(INS ins, VOID *v) {
 }
 
 
-uint32_t detected_arity(uint32_t param_threshold, UINT64* detection, uint32_t from) {
-    for (int i = from - 1; i >= 0; i--) {
+UINT64 detected_arity(UINT64 param_threshold, UINT64* detection, UINT64 count) {
+    for (int i = count - 1; i >= 0; i--) {
         if (detection[i] > param_threshold) {
             return i + 1;
         }
@@ -460,17 +479,19 @@ VOID fini(INT32 code, VOID *v) {
 
         inferred++;
 
-        uint32_t param_threshold = (int) ceil(nb_call[fid] * PARAM_THRESHOLD);
-        uint32_t return_threshold = (int) ceil(nb_call[fid] * RETURN_THRESHOLD);
+        UINT64 param_threshold = (UINT64) ceil(nb_call[fid] * PARAM_THRESHOLD);
+        UINT64 return_threshold = (UINT64) ceil(nb_call[fid] * RETURN_THRESHOLD);
 
-        uint32_t int_arity = detected_arity(
-                param_threshold, nb_param_intaddr[fid], PARAM_INT_COUNT);
-        uint32_t stack_arity = detected_arity(
-                param_threshold, nb_param_stack[fid], PARAM_STACK_COUNT);
-        uint32_t float_arity = detected_arity(
-                param_threshold, nb_param_float[fid], PARAM_FLOAT_COUNT);
+        UINT64 int_arity = detected_arity(param_threshold,
+                nb_param_int[fid], PARAM_INT_COUNT);
+        UINT64 int_stack_arity = detected_arity(param_threshold,
+                nb_param_int_stack[fid], PARAM_INT_STACK_COUNT);
+        UINT64 float_arity = detected_arity(param_threshold,
+                nb_param_float[fid], PARAM_FLOAT_COUNT);
+        UINT64 float_stack_arity = detected_arity(param_threshold,
+                nb_param_float_stack[fid], PARAM_FLOAT_STACK_COUNT);
 
-        uint32_t ret = 0;
+        UINT64 ret = 0;
         if (nb_ret_int[fid] > return_threshold) {
             ret = 1;
         }
@@ -481,13 +502,15 @@ VOID fini(INT32 code, VOID *v) {
         ofile << fn_img(fid) << ":" << fn_imgaddr(fid)
                 << ":" << fn_name(fid)
                 << ":" << int_arity
-                << ":" << stack_arity
+                << ":" << int_stack_arity
                 << ":" << float_arity
+                << ":" << float_stack_arity
                 << ":" << ret
                 << ":";
 
         for (unsigned int pid = 0; pid < int_arity; pid++) {
-            if (param_min_size[fid][pid] > 0 && param_min_size[fid][pid] < 64) {
+            UINT64 min_size = param_int_min_size[fid][pid];
+            if (min_size > 0 && min_size < 64) {
                 ofile << pid << ",";
             }
         }
@@ -507,10 +530,11 @@ VOID fini(INT32 code, VOID *v) {
 
 int main(int argc, char * argv[]) {
     nb_call = (UINT64 *) calloc(NB_FN_MAX, sizeof(UINT64));
+    nb_param_int = (UINT64 **) calloc(NB_FN_MAX, sizeof(UINT64 *));
+    nb_param_int_stack = (UINT64 **) calloc(NB_FN_MAX, sizeof(UINT64 *));
+    param_int_min_size = (UINT64 **) calloc(NB_FN_MAX, sizeof(UINT64 *));
     nb_param_float = (UINT64 **) calloc(NB_FN_MAX, sizeof(UINT64 *));
-    nb_param_intaddr = (UINT64 **) calloc(NB_FN_MAX, sizeof(UINT64 *));
-    param_min_size = (UINT64 **) calloc(NB_FN_MAX, sizeof(UINT64 *));
-    nb_param_stack = (UINT64 **) calloc(NB_FN_MAX, sizeof(UINT64 *));
+    nb_param_float_stack = (UINT64 **) calloc(NB_FN_MAX, sizeof(UINT64 *));
     nb_ret_int = (UINT64 *) calloc(NB_FN_MAX, sizeof(UINT64));
     nb_ret_float = (UINT64 *) calloc(NB_FN_MAX, sizeof(UINT64));
 
@@ -530,16 +554,6 @@ int main(int argc, char * argv[]) {
     // it is only needed in the end) because PIN seems
     // to mess up IO at some point
     ofile.open(KnobOutputFile.Value().c_str());
-
-    // TODO better way to get mode from cli
-    if (strcmp(KnobFunctionMode.Value().c_str(), "name") == 0) {
-        FN_MODE = FN_NAME;
-    } else if (strcmp(KnobFunctionMode.Value().c_str(), "addr") == 0) {
-        FN_MODE = FN_ADDR;
-    } else {
-        /* By default, names are used */
-        FN_MODE = FN_NAME;
-    }
 
     INS_AddInstrumentFunction(instrument_instruction, 0);
     RTN_AddInstrumentFunction(register_function, 0);
