@@ -8,6 +8,8 @@ from cmd2 import Cmd
 from confiture import Confiture, ConfigFileError
 from datetime import datetime
 
+from src.shell.command.memcomb import MemComb
+from src.shell.command.couple import Couple
 from src.shell.data.data import Data
 from src.shell.pin.pintool import Pintool
 from src.shell.result import Result
@@ -74,7 +76,7 @@ class ScatShell(Cmd):
 
     #========== LOG functions ==========#
 
-    def out(self, msg, verbose=True):
+    def out(self, msg, verbose=True, crlf=True):
         """
             Print message on standard input, with formatting.
 
@@ -82,7 +84,9 @@ class ScatShell(Cmd):
 
         """
         if verbose:
-            sys.stdout.write("[*] " + msg + "\n")
+            sys.stdout.write("[*] " + msg)
+            if crlf:
+                sys.stdout.write("\n")
 
     def stderr(self, msg):
         """
@@ -471,3 +475,24 @@ class ScatShell(Cmd):
             # Run inference
             self.out("Launching {0} inference on {1}".format(p, binary))
             p.launch(binary, args)
+
+    #========== ALLOC RETRIEVING ==========
+
+    def do_memcomb(self, s):
+        # Get log file from last block inference
+        if "memblock" not in self.__pintools.keys():
+            self.stderr("you must run memblock inference first")
+            return
+        logfile = self.__pintools["memblock"].get_logfile(s, prev=False)
+        MemComb(logfile, self.out).run()
+
+    #========== COUPLE FROM MEMBLOCK ==========
+
+    def do_couple(self, s):
+        # Get log file from last block inference
+        if "memblock" not in self.__pintools.keys():
+            self.stderr("you must run memblock inference first")
+            return
+        logfile = self.__pintools["memblock"].get_logfile(s, prev=False)
+        Couple(logfile, self.out).run()
+
