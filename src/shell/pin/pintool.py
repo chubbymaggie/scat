@@ -1,8 +1,14 @@
+#-*- coding: utf-8 -*-
 
 import os
 import subprocess
 import shutil
 from datetime import datetime
+
+from src.shell.analysis.arity import ArityAnalysis
+from src.shell.analysis.type import TypeAnalysis
+from src.shell.analysis.couple import CoupleAnalysis
+from src.shell.analysis.analysis import Analysis
 
 class Pintool(object):
 
@@ -23,21 +29,32 @@ class Pintool(object):
 
         # LOG function provided?
         if "stdout" in kwargs.keys():
-            self.stdout = kwargs["stdout"]
+            stdout = kwargs["stdout"]
         else:
             # If not, use the local one
-            self.stdout = self.__log
+            def stdout(msg, verbose):
+                return self.__log(msg, "[*] ", verbose)
+
+        self.stdout = stdout
+
         if "stderr" in kwargs.keys():
-            self.stderr = kwargs["stderr"]
+            stderr = kwargs["stderr"]
         else:
             # If not, use the local one
-            self.stderr = self.__log
+            def stderr(msg):
+                return self.__log(msg, "*** ", True)
+        self.stderr = stderr
 
         # Previous step required?
         if "prev_step" in kwargs.keys():
             self.__prev_step = kwargs["prev_step"]
         else:
             self.__prev_step = None
+
+        if "alt_prev_step" in kwargs.keys():
+            self.__alt_prev_step = kwargs["alt_prev_step"]
+        else:
+            self.__alt_prev_step = None
 
         # Set pintool code
         self.__code = Pintool.nb_pintools
@@ -51,8 +68,9 @@ class Pintool(object):
     def __str__(self):
         return self.__name
 
-    def __log(self, msg):
-        print msg
+    def __log(self, msg, pattern, verbose):
+        if verbose:
+            print(pattern + msg)
 
     @property
     def prev_step(self):
@@ -63,7 +81,19 @@ class Pintool(object):
         """
         return self.__prev_step
 
-    def __cmd(self, binary, args, logfile, infile=None):
+    @property
+    def alt_prev_step(self):
+        return self.__alt_prev_step
+
+    def __cmd(self, binary, args, logfile, debugfile, infile=None, pin_args="", 
+            alt_prev=False):
+        additional_options = ""
+        if alt_prev and self.__alt_prev_step == "coupleres":
+            additional_options += "-couple "
+        if self.__name == "uaf":
+            additional_options += "-memcomb {} ".format(self.get_logfile(binary, alt_prev=True))
+        if self.__name == "follow":
+            additional_options += "-addr {} ".format(int(raw_input("Address to follow: ")))
         if infile is not None:
             infile_opt = "-i {0}".format(infile)
         else:
@@ -72,30 +102,45 @@ class Pintool(object):
             cli_options = self.__pinconf["cli-options"]
         else:
             cli_options = ""
-        return "{0} {4} -t {1} -o {2} {3} -- {5} {6}".format(
-                                                                            self.__pinconf["bin"],
-                                                                            self.__obj_path,
-                                                                            logfile,
-                                                                            infile_opt,
-                                                                            cli_options,
-                                                                            binary,
-                                                                            " ".join(args),
-                                                                        )
+        return "{} {} -t {} -o {} -logfile {} {} {} {} -- {} {}".format(
+                self.__pinconf["bin"],
+                cli_options,
+                self.__obj_path,
+                logfile,
+                debugfile,
+                infile_opt,
+                pin_args,
+                additional_options,
+                binary,
+                " ".join(args),
+        )
 
-    def __gen_logfile(self, binary):
+
+    def __gen_outputfile(self, binary, timestamp, ext):
         """
-            Generate a name for a new log file. For example, for arity inference
-            on "grep", this will return grep_arity_{timestamp}.log.
+            Generate a name for a new output file. For example, for arity inference
+            on "grep", this will return grep_arity_{timestamp}.{ext}.
 
-            @param binary       name of the binary for which we require a log
+            @param binary       name of the binary for which we require the output file
 
-            @ret                the generated name for the log file.
+            @ret                the generated name for the output file.
 
         """
-        timestamp = datetime.now().strftime("%s")
-        return "{3}/{0}_{1}_{2}.log".format(os.path.basename(binary), str(self), timestamp, self.__logdir)
+        return "{}/{}_{}_{}.{}".format(
+                self.__logdir,
+                os.path.basename(binary),
+                str(self),
+                timestamp,
+                ext
+        )
 
-    def get_logfile(self, binary, prev=True):
+
+    def match_logfile(self, inf, binary, candidate):
+        name = "{2}/{0}_{1}_".format(os.path.basename(binary), inf, self.__logdir)
+        return candidate.startswith(name) and candidate.endswith(".log")
+
+
+    def get_logfile(self, binary, prev=True, alt_prev=False):
         """
             Retrieve the most recent logfile from the given step of inference.
 
@@ -110,27 +155,27 @@ class Pintool(object):
 
         """
         inf = self.__prev_step if prev else self
+        if alt_prev and self.__alt_prev_step is not None:
+            inf = self.__alt_prev_step
+        elif prev:
+            inf = self.__prev_step
+        else:
+            inf = self
+
         candidates = map(
-                                lambda x:
-                                    "{0}/{1}".format(self.__logdir, x),
-                                os.listdir(self.__logdir),
-                        )
+                lambda x: "{0}/{1}".format(self.__logdir, x),
+                os.listdir(self.__logdir),
+        )
         candidates = filter(
-                                lambda x:
-                                    (x.startswith("{2}/{0}_{1}".format(
-                                                                            os.path.basename(binary),
-                                                                            inf,
-                                                                            self.__logdir)
-                                                                        ) and
-                                    x.endswith(".log")),
-                                candidates,
-                            )
+                lambda x: self.match_logfile(inf, binary, x),
+                candidates,
+        )
         if len(candidates) == 0:
-            self.stderr("Cannot file result from {0} inference - ensure that you did run every step in order (arity > type > couple) for this binary".format(self))
+            self.stderr("{} file for program {} not found -- aborting".format(inf, binary))
             raise IOError
         return max(candidates, key=os.path.getmtime)
 
-    def launch(self, binary, args, verbose=True):
+    def launch(self, binary, args, params=None, verbose=True, alt_prev=False):
         """
             Launch specified inference on binary given in parameter
 
@@ -139,19 +184,27 @@ class Pintool(object):
 
             @param args     arguments to give to the binary
 
+            @param params   dictionnary of (parameter, value) values to set parameters
+                            for the analysis
+
             @param verbose  if True, print intermediate steps
 
         """
-        # if inf_code == INF_BASE:
-        #     cmd = "{0} {1}".format(binary, " ".join(args))
-        # else:
-        logfile = self.__gen_logfile(binary)
+        timestamp = datetime.now().strftime("%s")
+        logfile = self.__gen_outputfile(binary, timestamp, "log")
+        debugfile = self.__gen_outputfile(binary, timestamp, "dbg")
         if self.__prev_step is not None:
-            infile = self.get_logfile(binary)
+            infile = self.get_logfile(binary, alt_prev=alt_prev)
         else:
             infile = None
-        cmd = self.__cmd(binary, args, logfile, infile)
+        if params is not None:
+            pin_args = " ".join(["-{} {}".format(k, v) for k, v in params.items()])
+        else:
+            pin_args = ""
+        cmd = self.__cmd(binary, args, logfile, debugfile, infile, pin_args,
+                alt_prev=alt_prev)
         self.stdout(cmd, verbose)
+        #stop = raw_input()
         start = datetime.now()
         subprocess.call(cmd, shell=True)
         duration = datetime.now() - start
@@ -159,7 +212,7 @@ class Pintool(object):
         self.stdout("Execution time: {0}.{1}s".format(duration.seconds, duration.microseconds), verbose)
 
 
-    def compile(self, force, debug, trace):
+    def compile(self, force, debug, trace, verbose):
         """
             Compile all pintools needed
 
@@ -205,7 +258,7 @@ class Pintool(object):
                 obj_build_path,
                 obj_build_name)
 
-        self.stdout("Compiling pintool: {0} ...".format(src_name[:-4]))
+        self.stdout("Compiling pintool: {0} ...".format(src_name[:-4]), verbose=verbose)
         with open("/dev/null", 'w') as fnull:
             try:
                 subprocess.check_call(cmd, cwd=src_path, shell=True, stdout=fnull)
@@ -214,8 +267,21 @@ class Pintool(object):
                         '{}/{}.so'.format(obj_build_path, obj_build_name),
                         '{}/{}'.format(obj_path, obj_name))
                 if mtime_before == mtime_now:
-                    self.stdout("\t=> Up to date !")
+                    self.stdout("\t=> Up to date !", verbose=verbose)
                 else:
-                    self.stdout("\t=> Done !")
+                    self.stdout("\t=> Done !", verbose)
+                return True
             except subprocess.CalledProcessError as error:
-                self.stdout("/!\ Compilation exited with non-zero status {} /!\\\n\n".format(error.returncode))
+                self.stdout("/!\ Compilation exited with non-zero status {} /!\\\n\n".format(error.returncode), verbose=verbose)
+                return False
+
+    def get_analysis(self, pgm, data = None):
+        logfile = self.get_logfile(pgm, prev=False)
+        if str(self) == 'arity':
+            return ArityAnalysis(pgm, logfile, data)
+        elif str(self) == 'type':
+            return TypeAnalysis(pgm, logfile, data)
+        elif str(self) == 'couple':
+            return CoupleAnalysis(pgm, logfile)
+        else:
+            return Analysis(pgm, logfile)

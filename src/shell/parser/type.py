@@ -12,21 +12,31 @@ class TypeLogParser(ILogParser):
         self.__fn = None
         super(TypeLogParser, self).__init__(*args, **kwargs)
 
-    def __parse(self):
-        self.__fn = dict()
-        with open(self.log_path, "r") as log:
-            for line in log.readlines():
-                name, proto = line[:-1].split(":")[2:]
-                self.__fn[name] = proto.replace(" ", "").split(",")
-
     def get(self):
         if self.__fn is None:
-            self.__parse()
-        return self.__fn
+            self.__fn = dict()
+            with open(self.log_path, "r") as log:
+                # Skip first line
+                log.readline()
+                # Read parameters
+                for p in log.readline()[:-1].split(":"):
+                    k, v = p.split("=")
+                    self._params[k] = v
+                for line in log.readlines():
+                    l = line[:-1].split(":")
+                    name = ":".join(l[:3])
+                    proto = l[-1].replace(" ", "").split(",")
+                    self.__fn[name] = proto
+                    yield name, proto
+        else:
+            for name, proto in self.__fn.items():
+                yield name, proto
 
     def get_proto(self, fname):
         if self.__fn is None:
-            self.__parse()
+            # parse log
+            for f, g in self.get():
+                pass
         if fname in self.__fn.keys():
             # Remove confidence rate before returning proto
             return [arg[:arg.index("(")] if arg.count("(") > 0 else arg for arg in self.__fn[fname]]

@@ -3,17 +3,27 @@
 #include <iostream>
 #include <fstream>
 #include <cmath>
-#include <stdlib.h>
 
+#include <stdlib.h>
 #include <string.h>
+#include <sys/time.h>
 
 #include "pin.H"
 
-#define NB_CALLS_TO_CONCLUDE    50
+#define RET_OPTIMIZATION        0
+
 #define NB_FN_MAX               30000
 #define MAX_DEPTH               1000
-#define PARAM_THRESHOLD         0.10
-#define RETURN_THRESHOLD        0.05
+
+#define MIN_CALLS_DEFAULT       "5"
+
+#if RET_OPTIMIZATION
+    #define RET_THRESHOLD_DEFAULT   "0.50"
+#else
+    #define RET_THRESHOLD_DEFAULT   "0.10"
+#endif
+
+#define PARAM_THRESHOLD_DEFAULT "0.10"
 
 #define PARAM_INT_COUNT          6
 #define PARAM_INT_STACK_COUNT   10
@@ -25,12 +35,30 @@
 #include "utils/registers.h"
 #include "utils/hollow_stack.h"
 
+/* ANALYSIS PARAMETERS - default values can be overwritten by command line arguments */
+unsigned int MIN_CALLS;
+KNOB<string> KnobMinCalls(KNOB_MODE_WRITEONCE, "pintool", "min_calls", MIN_CALLS_DEFAULT, "Specify a number for MIN_CALLS");
+float PARAM_THRESHOLD; 
+KNOB<string> KnobParamThreshold(KNOB_MODE_WRITEONCE, "pintool", "param_threshold", PARAM_THRESHOLD_DEFAULT, "Specify a number for PARAM_THRESHOLD");
+float RET_THRESHOLD; 
+KNOB<string> KnobRetThreshold(KNOB_MODE_WRITEONCE, "pintool", "ret_threshold", RET_THRESHOLD_DEFAULT, "Specify a number for RET_THRESHOLD");
+
+
+/* Out file to store analysis results */
 ofstream ofile;
-// TODO change "mouaha"
-KNOB<string> KnobOutputFile(KNOB_MODE_WRITEONCE, "pintool", "o", "mouaha", "Specify an output file");
+KNOB<string> KnobOutputFile(KNOB_MODE_WRITEONCE, "pintool", "o", "/dev/null", "Specify an output file");
+
+/* Time of instrumentation */
+struct timeval start, stop; 
+
+/* Address of the Global Offset Table */
+ADDRINT got_beg = 0;
+ADDRINT got_end = 0;
 
 /* Call stack */
 HollowStack<MAX_DEPTH, FID> call_stack;
+/* Call stack is jump */
+HollowStack<MAX_DEPTH, bool> is_jump_stack;
 /* A stack which keeps track of the program stack pointers */
 HollowStack<MAX_DEPTH, UINT64> sp_stack;
 
@@ -85,11 +113,13 @@ inline UINT64 sp(CONTEXT* ctxt) {
 /*  Function called each time a procedure
  *  is called in the instrumented binary
  */
-VOID fn_call(CONTEXT* ctxt, FID fid) {
+VOID fn_call(CONTEXT* ctxt, FID fid, bool is_jump) {
     trace_enter();
 
     call_stack.push(fid);
     sp_stack.push(sp(ctxt));
+    is_jump_stack.push(is_jump);
+
     nb_call[fid]++;
 
     reg_maybe_return[REGF_AX] = false;
@@ -98,7 +128,7 @@ VOID fn_call(CONTEXT* ctxt, FID fid) {
     trace_leave();
 }
 
-VOID fn_indirect_call(CONTEXT* ctxt, ADDRINT target) {
+VOID fn_indirect_call(CONTEXT* ctxt, ADDRINT target, bool is_jump) {
     trace_enter();
 
     // Indirect call, we have to look up the function each time
@@ -109,14 +139,21 @@ VOID fn_indirect_call(CONTEXT* ctxt, ADDRINT target) {
     PIN_LockClient();
     FID fid = fn_lookup_by_address(target);
     if (fid == FID_UNKNOWN) {
-        fid = fn_register_from_address(target);
-        if (fid != FID_UNKNOWN) {
-            fn_registered(fid);
+        IMG img = IMG_FindByAddress(target);
+        if (!is_jump || (IMG_Valid(img) && IMG_Name(img) == "libc.so.6")) {
+            fid = fn_register_from_address(target);
+            if (fid != FID_UNKNOWN) {
+                fn_registered(fid);
+            }
         }
+    }
+    if (is_jump && fid == FID_UNKNOWN) {
+        // std::cerr << "jumping: " << target << endl;
+        return;
     }
     PIN_UnlockClient();
 
-    fn_call(ctxt, fid);
+    fn_call(ctxt, fid, is_jump);
 
     trace_leave();
 }
@@ -126,11 +163,6 @@ void update_param_int_min_size(FID fid, UINT64 pid, REGF regf, UINT32 read_size)
     UINT64 candidate_min_size = read_size < last_written_size[regf]
             ? last_written_size[regf]
             : read_size;
-
-    // Zero are irrelevant
-    // (Fairly usual value for both int and address)
-    if (candidate_min_size == 0)
-        return;
 
     if (param_int_min_size[fid][pid] > candidate_min_size)
         param_int_min_size[fid][pid] = candidate_min_size;
@@ -143,23 +175,48 @@ void update_param_int_min_size(FID fid, UINT64 pid, REGF regf, UINT32 read_size)
 VOID fn_ret() {
     trace_enter();
 
+#if !RET_OPTIMIZATION
+     if (call_stack.height() == written[REGF_AX] &&
+             reg_maybe_return[REGF_AX])
+         nb_ret_int[call_stack.top()]++;
+     if (call_stack.height() == written[REGF_XMM0] &&
+             reg_maybe_return[REGF_XMM0])
+         nb_ret_float[call_stack.top()]++;
+#endif
     if (!call_stack.is_top_forgotten()) {
+        while (is_jump_stack.top()) {
+
+#if RET_OPTIMIZATION
+            if (reg_maybe_return[REGF_AX])
+                nb_ret_int[call_stack.top()]++;
+            else if (reg_maybe_return[REGF_XMM0])
+                nb_ret_float[call_stack.top()]++;
+#endif
+            call_stack.pop();
+            is_jump_stack.pop();
+            sp_stack.pop();
+        }
+#if RET_OPTIMIZATION
         if (reg_maybe_return[REGF_AX])
             nb_ret_int[call_stack.top()]++;
         else if (reg_maybe_return[REGF_XMM0])
             nb_ret_float[call_stack.top()]++;
+#endif
+        call_stack.pop();
+        is_jump_stack.pop();
+        sp_stack.pop();
     }
 
+#if RET_OPTIMIZATION
     reg_maybe_return[REGF_AX] = false;
     reg_maybe_return[REGF_XMM0] = false;
+#endif
 
     for (int regf = REGF_FIRST; regf <= REGF_LAST; regf++) {
         reg_ret_since_written[regf] = true;
     }
 
-    call_stack.pop();
-    sp_stack.pop();
-
+    
     trace_leave();
 }
 
@@ -220,6 +277,11 @@ VOID return_read(REGF regf, UINT32 reg_size) {
         return;
     }
 
+#if !RET_OPTIMIZATION
+    if (!reg_maybe_return[regf])
+        return;
+#endif
+
     // Discards the previous write as a potential
     // return value. Reading the value does not
     // necessarily mean the register cannot be a
@@ -233,10 +295,17 @@ VOID return_read(REGF regf, UINT32 reg_size) {
     UINT64 *nb_ret = regf == REGF_AX
             ? nb_ret_int
             : nb_ret_float;
+
     // Propagate the return value up the call stack
-    for (int i = call_stack.height() + 1; i <= written[regf]; i++)
-        if (!call_stack.is_forgotten(i))
-            nb_ret[call_stack.peek(i)] += 1;
+    for (int i = call_stack.height() + 1; i <= written[regf]; i++){
+        if (!call_stack.is_forgotten(i)) {
+            FID fid = call_stack.peek(i);
+            nb_ret[fid] += 1;
+            // Note : This is disable since it provides
+            // worse type inference results :
+            // update_param_int_min_size(fid, 0, regf, reg_size);
+        }
+    }
 
     trace_leave();
 }
@@ -402,17 +471,21 @@ VOID instrument_instruction(INS ins, VOID *v) {
             nb_param = nb_param_int_stack;
             nb_param_count = PARAM_INT_STACK_COUNT;
         }
-
+        nb_param = nb_param;
+        nb_param_count = nb_param_count;
+#if 1
         INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR) stack_read,
                 IARG_MEMORYREAD_EA,
                 IARG_MEMORYREAD_SIZE,
                 IARG_PTR, nb_param,
                 IARG_UINT32, nb_param_count,
                 IARG_END);
+#endif
     }
 
     if (INS_IsCall(ins)) {
-        if (INS_IsDirectCall(ins)) {
+        if (INS_IsDirectCall(ins)) { //  || (vOPCode != XED_ICLASS_CALL_FAR)) {
+#if 1
             ADDRINT addr = INS_DirectBranchOrCallTargetAddress(ins);
             FID fid = fn_lookup_by_address(addr);
             if (fid == FID_UNKNOWN) {
@@ -427,18 +500,43 @@ VOID instrument_instruction(INS ins, VOID *v) {
                         (AFUNPTR) fn_call,
                         IARG_CONST_CONTEXT,
                         IARG_UINT32, fid,
+                        IARG_BOOL, false,
                         IARG_END);
-        }
-        else {
+#endif
+        } else {
+#if 1
             INS_InsertCall(ins,
                         IPOINT_BEFORE,
                         (AFUNPTR) fn_indirect_call,
                         IARG_CONST_CONTEXT,
                         IARG_BRANCH_TARGET_ADDR,
+                        IARG_BOOL, false,
                         IARG_END);
+#endif
         }
     }
 
+#if 1
+    if (INS_IsIndirectBranchOrCall(ins) && !INS_IsFarCall(ins) && !INS_IsFarJump(ins) && !INS_IsFarRet(ins)) {
+        if ((!INS_IsCall(ins)) && INS_IsBranchOrCall(ins) 
+                /* This condition fixes runtime crash of pin on some programs
+                   (e.g. git) -- but I am not sure it is a correct answer, it 
+                   might have bad effects on the results of inference */
+#if 1
+                    && (INS_Category(ins) != XED_CATEGORY_COND_BR)
+#endif
+                    ) {
+                INS_InsertCall(ins,
+                        IPOINT_BEFORE,
+                        (AFUNPTR) fn_indirect_call,
+                        IARG_CONST_CONTEXT,
+                        IARG_BRANCH_TARGET_ADDR,
+                        IARG_BOOL, true,
+                        IARG_END);
+            
+        }
+    }
+#endif
     if (INS_IsRet(ins)) {
         INS_InsertCall(ins,
                     IPOINT_BEFORE,
@@ -466,13 +564,19 @@ UINT64 detected_arity(UINT64 param_threshold, UINT64* detection, UINT64 count) {
 VOID fini(INT32 code, VOID *v) {
     trace_enter();
 
+    gettimeofday(&stop, NULL);
+
+    ofile << (stop.tv_usec / 1000.0 + 1000 * stop.tv_sec - start.tv_sec * 1000 - start.tv_usec / 1000.0) / 1000.0 << endl;
+
     debug("Hash table buckets mean size : %lf\n", fn_bucket_mean_size());
 
     int inferred = 0;
     int dismissed = 0;
 
+    ofile << "MIN_CALLS=" << MIN_CALLS << ":PARAM_THRESHOLD=" << PARAM_THRESHOLD << ":RET_THRESHOLD=" << RET_THRESHOLD << endl;
+
     for (FID fid = 1; fid <= fn_nb(); fid++) {
-        if (nb_call[fid] < NB_CALLS_TO_CONCLUDE) {
+        if (nb_call[fid] < MIN_CALLS) {
             dismissed++;
             continue;
         }
@@ -480,7 +584,7 @@ VOID fini(INT32 code, VOID *v) {
         inferred++;
 
         UINT64 param_threshold = (UINT64) ceil(nb_call[fid] * PARAM_THRESHOLD);
-        UINT64 return_threshold = (UINT64) ceil(nb_call[fid] * RETURN_THRESHOLD);
+        UINT64 return_threshold = (UINT64) ceil(nb_call[fid] * RET_THRESHOLD);
 
         UINT64 int_arity = detected_arity(param_threshold,
                 nb_param_int[fid], PARAM_INT_COUNT);
@@ -490,6 +594,10 @@ VOID fini(INT32 code, VOID *v) {
                 nb_param_float[fid], PARAM_FLOAT_COUNT);
         UINT64 float_stack_arity = detected_arity(param_threshold,
                 nb_param_float_stack[fid], PARAM_FLOAT_STACK_COUNT);
+
+        // Maxes out int & float arities if stack is used
+        if (int_stack_arity > 0) int_arity = PARAM_INT_COUNT;
+        if (float_stack_arity > 0) float_arity = PARAM_FLOAT_COUNT;
 
         UINT64 ret = 0;
         if (nb_ret_int[fid] > return_threshold) {
@@ -550,6 +658,11 @@ int main(int argc, char * argv[]) {
 
     if (PIN_Init(argc, argv)) return 1;
 
+    /* Get parameters of analysis from command line */
+    MIN_CALLS = std::atoi(KnobMinCalls.Value().c_str());
+    PARAM_THRESHOLD = std::atof(KnobParamThreshold.Value().c_str());
+    RET_THRESHOLD = std::atof(KnobRetThreshold.Value().c_str());
+
     // We need to open this file early (even though
     // it is only needed in the end) because PIN seems
     // to mess up IO at some point
@@ -569,6 +682,9 @@ int main(int argc, char * argv[]) {
     // ensure the log file is opened because PIN seems
     // to mess up IO at some point
     debug_trace_init();
+    
+    gettimeofday(&start, NULL);
+   
     PIN_StartProgram();
 
     return 0;

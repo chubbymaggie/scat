@@ -15,7 +15,7 @@
  */
 typedef enum {
     /* ERROR REGISTER */
-    REGF_NULL, 
+    REGF_NULL,
 
     /* Return register */
     REGF_AX,
@@ -159,6 +159,56 @@ UINT32 reg_size(REG reg) {
         // TODO handle this properly
         return REGF_NULL;
     }
+}
+
+string regf_string(REGF regf) {
+    switch (regf) {
+        case REGF_AX: return "REGF_AX";
+        case REGF_DI: return "REGF_DI";
+        case REGF_SI: return "REGF_SI";
+        case REGF_DX: return "REGF_DX";
+        case REGF_CX: return "REGF_CX";
+        case REGF_R8: return "REGF_R8";
+        case REGF_R9: return "REGF_R9";
+        case REGF_XMM0: return "REGF_XMM0";
+        case REGF_XMM1: return "REGF_XMM1";
+        case REGF_XMM2: return "REGF_XMM2";
+        case REGF_XMM3: return "REGF_XMM3";
+        case REGF_XMM4: return "REGF_XMM4";
+        case REGF_XMM5: return "REGF_XMM5";
+        case REGF_XMM6: return "REGF_XMM6";
+        case REGF_XMM7: return "REGF_XMM7";
+        default: return "Unknown";
+    }
+}
+
+REG param_reg(unsigned int pid) {
+    switch (pid) {
+    case 0:
+        return REG_RAX;
+    case 1:
+        return REG_RDI;
+    case 2:
+        return REG_RSI;
+    case 3:
+        return REG_RDX;
+    case 4:
+        return REG_RCX;
+    case 5:
+        return REG_R8;
+    case 6:
+        return REG_R9;
+    default:
+        return REG_INVALID();
+    }
+}
+
+ADDRINT get_param_value(CONTEXT *ctxt, unsigned int pid) {
+    if (pid <= 6)
+        return PIN_GetContextReg(ctxt, param_reg(pid));
+    else 
+        /* TODO take stack parameters into account */
+        return 0;
 }
 
 #endif

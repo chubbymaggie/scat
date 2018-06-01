@@ -1,69 +1,81 @@
 #-*- coding: utf-8 -*-
 
-from src.shell.command.i_command import ICommand
-from src.shell.parser.block_trace import BlockTraceParser
+import traceback
 
-class MemComb(ICommand):
+from .i_command import ICommand
+
+from src.shell.memory.memcomb import MemComb
+from src.shell.utils import *
+
+class MemCombCmd(ICommand):
     """
-        Retrieve allocators
+        usage: memcomb program [OPTION]
 
+        Optional arguments:
+            --lib: search also in the library used by the binary
+            --ignore=<keyword1,keyword2,..>: ignore all the memory blocks
+                containig at least one of the keywords
+            --libmatch=<keyword1,keyword2,..>: keep only the memory blocks
+                that matches at least one of the keywords
+            --couple: enable the filtering of free candidate. Only the functions
+                coupled with the infered allocator will be evaluated.
+                Requires `couple program` to be run before.
+
+        memcomb must be used only after using succesfully `launch type` and
+        `launch memalloc`
     """
 
-    def __init__(self, log_file, log):
-        super(MemComb, self).__init__()
-        self.__parser = BlockTraceParser(log_file)
-        self.log = log
-
-    def run(self):
-        func = dict()
-        addr_seen = list()
-        for i in xrange(BlockTraceParser.DATA_SIZE):
-            addr_seen.append(list())
-        for io, typ, val, name, counter in self.__parser.get():
-            print io, typ, val, name, counter
-            if name not in func.keys():
-                func[name] = [0]
-            if io == "out" and typ == "addr":
-                func[name][0] += 1
-                # key = val % BlockTraceParser.DATA_SIZE
-                # if val not in addr_seen[key]:
-                #     func[name][0] += 1
-            #key = val % BlockTraceParser.DATA_SIZE
-            #if val not in addr_seen[key]:
-            #    addr_seen[key].append(val)
-        alloc_s = sorted(func.items(), key=lambda a:a[1][0])[-1]
-        for a in alloc_s[:100]:
-            print a
+    def __init__(self, pintools, logdir, *args, **kwargs):
+        self.__pintools = pintools
+        self.__logdir = logdir
+        super(MemCombCmd, self).__init__(*args, **kwargs)
         return
-        self.log("allocator found - {0}".format(alloc_s))
-        return
-        addr_alloc = list()
-        for i in xrange(BlockTraceParser.DATA_SIZE):
-            addr_alloc.append(dict())
-        for io, typ, val, name, counter in self.__parser.get():
-            key = val % BlockTraceParser.DATA_SIZE
-            if val not in addr_alloc[key].keys():
-                addr_alloc[key][val] = list()
-            if io == "out" and typ == "addr" and name == alloc_s:
-                key = val % BlockTraceParser.DATA_SIZE
-                addr_alloc[key][val].append(name)
-            elif io == "in" and typ == "addr" and name != alloc_s:
-                addr_alloc[key][val].append(name)
-        func = dict()
-        for val in addr_alloc:
-            for addr, call in val.items():
-                if len(call) == 0 or call[0] != alloc_s:
-                    continue
-                while call.count(alloc_s) > 0:
-                    if call.index(alloc_s) == 0:
-                        call.pop(0)
-                    else:
-                        free = call[call.index(alloc_s) - 1]
-                        if free not in func.keys():
-                            func[free] = 0
-                        func[free] += 1
-                        call = call[call.index(alloc_s)+1:]
-        free_s = sorted(func.items(), key=lambda a:a[1])[-1][0]
-        self.log("liberator found - {0}".format(free_s))
-        return # alloc_s, free_s
 
+    def run(self, s, *args, **kwargs):
+        # Get log file from last block inference
+        if "memalloc" not in self.__pintools.keys():
+            self.stderr("you must run memalloc inference first")
+            return
+
+        if len(s) == 0:
+            self.stderr("You must give at least one argument (pgm)")
+            return
+
+
+        s = s.split()
+        cli_ignore = None
+        cli_libmatch = None
+        libraries = False
+        couple = False
+        for i in s:
+            if "--ignore=" in i:
+                cli_ignore = i.replace("--ignore=","").split(",")
+            if "--libmatch=" in i:
+                cli_libmatch = i.replace("--libmatch=","").split(",")
+            if i == "--lib":
+                libraries = True
+            if i == "--couple":
+                couple = True
+
+
+        try:
+            proto_logfile = self.__pintools["type"].get_logfile(s[0], prev=False)
+            mem_logfile = self.__pintools["memalloc"].get_logfile(s[0], prev=False)
+            if couple:
+                coupleres_logfile = self.__pintools["memalloc"].get_logfile(
+                        s[0], alt_prev=True)
+            else:
+                coupleres_logfile = None
+        except IOError:
+            self.stderr("Logs for binary \"{}\" not found".format(s[0]))
+            return
+
+        try:
+            MemComb(mem_logfile, proto_logfile, s[0], cli_ignore,
+                    cli_libmatch, coupleres_logfile).run(libraries=libraries)
+        except Exception as e:
+            traceback.print_exc()
+            raise e
+
+    def complete(self, text, line, begidx, endidx):
+        return complete_pgm_pintool(text, line, self.__logdir, complete_pintool=False)

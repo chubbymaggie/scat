@@ -1,43 +1,51 @@
 #-*- coding: utf-8 -*-
 
-from src.shell.command.i_command import ICommand
-from src.shell.parser.block_trace import BlockTraceParser, BlockTrace
+from .i_command import ICommand
 
-class Couple(ICommand):
+from src.shell.couple.couple import Couple
+from src.shell.utils import *
+
+class CoupleCmd(ICommand):
     """
-        Retrieve couples
+        usage: couple program [--min_rho=<value>]
 
+        Optional argument:
+            --min_rho=<value>: minimum value of the rho coefficient for two
+                function to be considered coupled
+
+        Non-optional argument:
+            program: program you want to compute couples on
+
+        couple must be used only after using successfully `launch couple`
     """
 
-    def __init__(self, log_file, log):
-        super(Couple, self).__init__()
-        self.__parser = BlockTraceParser(log_file)
-        self.log = log
-
-    def run(self):
-        inp = dict()
-        out = dict()
-        SIZE_LIMIT = 10000
-        for block in self.__parser.get():
-            if block.type != BlockTrace.ADDR:
-                continue
-            if block.io == BlockTrace.IN:
-                if block.id not in inp.keys():
-                    inp[block.id] = list()
-                if len(inp[block.id]) < SIZE_LIMIT:
-                    inp[block.id].append(block.val)
-            elif block.io == BlockTrace.OUT:
-                if block.id not in out.keys():
-                    out[block.id] = list()
-                out[block.id].append(block.val)
-        print len(inp), len(out)
-        for g, param_in in out.items():
-            for f, param_out in inp.items():
-                nb = 0
-                for param in param_in:
-                    if param in param_out:
-                        nb += 1
-                if float(nb) / float(len(param_in)) > 0.5:
-                    print f, g
+    def __init__(self, pintools, logdir, *args, **kwargs):
+        self.__pintools = pintools
+        self.__logdir = logdir
+        super(CoupleCmd, self).__init__(*args, **kwargs)
         return
 
+    def run(self, s, *args, **kwargs):
+        # Get log file from last block inference
+        if "couple" not in self.__pintools.keys():
+            self.stderr("you must run memblock inference first")
+            return
+        if len(s) == 0:
+            self.stderr("You must give at least one argument (pgm)")
+            return
+
+        s = s.split()
+        min_rho = 0.5
+        for i in s:
+            if "--min_rho" in i:
+                min_rho = float(i.replace("--min_rho=",""))
+
+        try:
+            logfile = self.__pintools["couple"].get_logfile(s[0], prev=False)
+        except IOError:
+            self.stderr("Logs for binary \"{}\" not found".format(s[0]))
+            return
+        Couple(logfile, s[0]).run(min_rho=min_rho)
+
+    def complete(self, text, line, begidx, endidx):
+        return complete_pgm_pintool(text, line, self.__logdir, complete_pintool=False)
